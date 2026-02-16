@@ -16,6 +16,9 @@ pub enum HaunterError {
     #[error("network error: {0}")]
     Network(String),
 
+    #[error("dns error: {0}")]
+    Dns(String),
+
     #[error("insufficient permissions — run with sudo")]
     PermissionDenied,
 }

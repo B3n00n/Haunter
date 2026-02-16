@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use pnet::datalink::{MacAddr, NetworkInterface};
 
+use haunter::core::dns::DnsRule;
 use haunter::core::scanner;
 use haunter::core::spoofer::Spoofer;
 use haunter::core::stealth::StealthConfig;
@@ -20,16 +21,18 @@ pub enum Tab {
     Interfaces,
     Scanner,
     Spoofer,
+    Dns,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Interfaces, Tab::Scanner, Tab::Spoofer];
+    pub const ALL: [Tab; 4] = [Tab::Interfaces, Tab::Scanner, Tab::Spoofer, Tab::Dns];
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Interfaces => "Interfaces",
             Tab::Scanner => "Scanner",
             Tab::Spoofer => "Spoofer",
+            Tab::Dns => "DNS",
         }
     }
 
@@ -37,17 +40,27 @@ impl Tab {
         match self {
             Tab::Interfaces => Tab::Scanner,
             Tab::Scanner => Tab::Spoofer,
-            Tab::Spoofer => Tab::Interfaces,
+            Tab::Spoofer => Tab::Dns,
+            Tab::Dns => Tab::Interfaces,
         }
     }
 
     pub fn prev(self) -> Tab {
         match self {
-            Tab::Interfaces => Tab::Spoofer,
+            Tab::Interfaces => Tab::Dns,
             Tab::Scanner => Tab::Interfaces,
             Tab::Spoofer => Tab::Scanner,
+            Tab::Dns => Tab::Spoofer,
         }
     }
+}
+
+/// Text input state machine for the DNS rule editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsInput {
+    Inactive,
+    Domain(String),
+    Ip { domain: String, ip: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +102,11 @@ pub struct App {
     pub spoofer_state: SpooferState,
     pub spoof_stop: Option<Arc<AtomicBool>>,
 
+    // DNS tab
+    pub dns_rules: Vec<DnsRule>,
+    pub dns_index: usize,
+    pub dns_input: DnsInput,
+
     // Log panel
     pub logs: Vec<String>,
 
@@ -117,6 +135,9 @@ impl App {
             forward: true,
             spoofer_state: SpooferState::Idle,
             spoof_stop: None,
+            dns_rules: Vec::new(),
+            dns_index: 0,
+            dns_input: DnsInput::Inactive,
             logs: Vec::new(),
             event_tx,
             event_rx,
@@ -200,6 +221,84 @@ impl App {
         self.log(format!("[*] IP forwarding: {state}"));
     }
 
+    /// Begin adding a DNS rule (enter domain input mode).
+    pub fn start_dns_add(&mut self) {
+        self.dns_input = DnsInput::Domain(String::new());
+    }
+
+    /// Append a character to the active DNS input field.
+    pub fn dns_input_char(&mut self, c: char) {
+        match &mut self.dns_input {
+            DnsInput::Domain(s) => s.push(c),
+            DnsInput::Ip { ip, .. } => ip.push(c),
+            DnsInput::Inactive => {}
+        }
+    }
+
+    /// Delete the last character from the active DNS input field.
+    pub fn dns_input_backspace(&mut self) {
+        match &mut self.dns_input {
+            DnsInput::Domain(s) => { s.pop(); }
+            DnsInput::Ip { ip, .. } => { ip.pop(); }
+            DnsInput::Inactive => {}
+        }
+    }
+
+    /// Confirm the current DNS input step.
+    pub fn dns_input_confirm(&mut self) {
+        match self.dns_input.clone() {
+            DnsInput::Domain(domain) => {
+                let domain = domain.trim().to_string();
+                if domain.is_empty() {
+                    self.log("[!] Domain cannot be empty.");
+                    self.dns_input = DnsInput::Inactive;
+                    return;
+                }
+                self.dns_input = DnsInput::Ip {
+                    domain,
+                    ip: String::new(),
+                };
+            }
+            DnsInput::Ip { domain, ip } => {
+                let ip_str = ip.trim().to_string();
+                match ip_str.parse::<Ipv4Addr>() {
+                    Ok(spoof_ip) => {
+                        self.log(format!("[*] DNS rule added: {domain} -> {spoof_ip}"));
+                        self.dns_rules.push(DnsRule {
+                            domain,
+                            spoof_ip,
+                        });
+                        self.dns_input = DnsInput::Inactive;
+                    }
+                    Err(_) => {
+                        self.log(format!("[!] Invalid IP address: {ip_str}"));
+                        self.dns_input = DnsInput::Inactive;
+                    }
+                }
+            }
+            DnsInput::Inactive => {}
+        }
+    }
+
+    /// Cancel DNS input.
+    pub fn dns_input_cancel(&mut self) {
+        self.dns_input = DnsInput::Inactive;
+    }
+
+    /// Remove the currently selected DNS rule.
+    pub fn remove_dns_rule(&mut self) {
+        if self.dns_index < self.dns_rules.len() {
+            let removed = self.dns_rules.remove(self.dns_index);
+            self.log(format!(
+                "[*] DNS rule removed: {} -> {}",
+                removed.domain, removed.spoof_ip
+            ));
+            if self.dns_index > 0 && self.dns_index >= self.dns_rules.len() {
+                self.dns_index -= 1;
+            }
+        }
+    }
+
     /// Start the spoofer in a background thread.
     pub fn start_spoofer(&mut self) {
         let iface = match &self.selected_iface {
@@ -226,6 +325,7 @@ impl App {
         self.spoofer_state = SpooferState::Running;
         let target_ip = self.target_ip;
         let forward = self.forward;
+        let dns_rules = self.dns_rules.clone();
         let tx = self.event_tx.clone();
         let stop = Arc::new(AtomicBool::new(false));
         self.spoof_stop = Some(stop.clone());
@@ -239,6 +339,7 @@ impl App {
                 target_ip,
                 forward,
                 Some(StealthConfig::default()),
+                dns_rules,
             ) {
                 Ok(s) => s,
                 Err(e) => {

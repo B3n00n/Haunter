@@ -1,5 +1,6 @@
 pub mod arp;
 pub mod channel;
+pub mod dns;
 pub mod interface;
 
 use std::net::Ipv4Addr;

@@ -1,12 +1,14 @@
 use std::fs;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use pnet::datalink::{MacAddr, NetworkInterface};
 
+use crate::core::dns::{self as core_dns, DnsRule};
 use crate::core::scanner;
 use crate::core::stealth::{self, StealthConfig, TtlGuard};
 use crate::core::timing::SpoofPacer;
@@ -24,11 +26,13 @@ const IP_FORWARD_PATH: &str = "/proc/sys/net/ipv4/ip_forward";
 pub struct Spoofer {
     iface: NetworkInterface,
     our_mac: MacAddr,
+    our_ip: Ipv4Addr,
     pub gateway_ip: Ipv4Addr,
     pub gateway_mac: MacAddr,
     pub targets: Vec<Device>,
     pub forward: bool,
     stealth: Option<StealthConfig>,
+    dns_rules: Vec<DnsRule>,
 }
 
 impl Spoofer {
@@ -43,6 +47,7 @@ impl Spoofer {
         target_ip: Option<Ipv4Addr>,
         forward: bool,
         stealth: Option<StealthConfig>,
+        dns_rules: Vec<DnsRule>,
     ) -> Result<Self> {
         let our_mac = iface
             .mac
@@ -74,11 +79,13 @@ impl Spoofer {
         Ok(Self {
             iface,
             our_mac,
+            our_ip,
             gateway_ip,
             gateway_mac,
             targets,
             forward,
             stealth,
+            dns_rules,
         })
     }
 
@@ -133,6 +140,38 @@ impl Spoofer {
 
         let mut channel = Channel::open(&self.iface, CHANNEL_READ_TIMEOUT)?;
 
+        // Spawn DNS interceptor thread if rules are configured and forwarding is on.
+        let dns_log_rx = if self.forward && !self.dns_rules.is_empty() {
+            let (dns_log_tx, dns_log_rx) = mpsc::channel::<String>();
+            let dns_iface = self.iface.clone();
+            let dns_rules = self.dns_rules.clone();
+            let dns_mac = self.our_mac;
+            let dns_ip = self.our_ip;
+            let dns_targets = self.targets.clone();
+            let dns_stop = stop.clone();
+
+            thread::spawn(move || {
+                let result = core_dns::run(
+                    &dns_iface,
+                    &dns_rules,
+                    dns_mac,
+                    dns_ip,
+                    &dns_targets,
+                    dns_stop,
+                    |msg| {
+                        let _ = dns_log_tx.send(msg.to_string());
+                    },
+                );
+                if let Err(e) = result {
+                    let _ = dns_log_tx.send(format!("[!] DNS interceptor error: {e}"));
+                }
+            });
+
+            Some(dns_log_rx)
+        } else {
+            None
+        };
+
         while !stop.load(Ordering::Relaxed) {
             self.send_poison(&mut channel)?;
 
@@ -161,6 +200,13 @@ impl Spoofer {
                     if !remaining.is_zero() {
                         thread::sleep(remaining.min(CHANNEL_READ_TIMEOUT));
                     }
+                }
+            }
+
+            // Drain DNS interceptor log messages.
+            if let Some(rx) = &dns_log_rx {
+                while let Ok(msg) = rx.try_recv() {
+                    log(&msg);
                 }
             }
         }

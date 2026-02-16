@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap};
 
-use super::app::{App, SpooferState, Tab};
+use super::app::{App, DnsInput, SpooferState, Tab};
 
 const ACCENT: Color = Color::Magenta;
 const SUCCESS: Color = Color::Green;
@@ -51,6 +51,7 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
         Tab::Interfaces => draw_interfaces(f, app, area),
         Tab::Scanner => draw_scanner(f, app, area),
         Tab::Spoofer => draw_spoofer(f, app, area),
+        Tab::Dns => draw_dns(f, app, area),
     }
 }
 
@@ -366,6 +367,113 @@ fn draw_spoofer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(log_panel, chunks[1]);
 }
 
+fn draw_dns(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .split(area);
+
+    // Input bar / instructions
+    let input_line = match &app.dns_input {
+        DnsInput::Inactive => {
+            if app.dns_rules.is_empty() {
+                Line::from(Span::styled(
+                    " Press 'a' to add a DNS spoofing rule.",
+                    Style::default().fg(DIM),
+                ))
+            } else {
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {} rule(s) configured", app.dns_rules.len()),
+                        Style::default().fg(SUCCESS),
+                    ),
+                    Span::styled(
+                        "  |  These rules are applied when the spoofer runs with forwarding ON.",
+                        Style::default().fg(DIM),
+                    ),
+                ])
+            }
+        }
+        DnsInput::Domain(s) => Line::from(vec![
+            Span::styled(" Domain: ", Style::default().fg(ACCENT)),
+            Span::styled(s.as_str(), Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(ACCENT)),
+        ]),
+        DnsInput::Ip { domain, ip } => Line::from(vec![
+            Span::styled(
+                format!(" {domain} -> IP: "),
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(ip.as_str(), Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(ACCENT)),
+        ]),
+    };
+
+    let input_bar = Paragraph::new(input_line).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT)),
+    );
+    f.render_widget(input_bar, chunks[0]);
+
+    // Rules table
+    let header = Row::new(vec![
+        Cell::from("#").style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Cell::from("Domain").style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Cell::from("Spoof IP").style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+    ])
+    .height(1);
+
+    let rows: Vec<Row> = app
+        .dns_rules
+        .iter()
+        .enumerate()
+        .map(|(i, rule)| {
+            let style = if i == app.dns_index {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(DIM)
+            };
+
+            Row::new(vec![
+                Cell::from(format!("{}", i + 1)),
+                Cell::from(rule.domain.clone()),
+                Cell::from(rule.spoof_ip.to_string()),
+            ])
+            .style(style)
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(4),
+        Constraint::Min(20),
+        Constraint::Length(16),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT))
+                .title(" DNS Rules ")
+                .title_style(Style::default().fg(ACCENT)),
+        )
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    f.render_stateful_widget(
+        table,
+        chunks[1],
+        &mut ratatui::widgets::TableState::default().with_selected(
+            if app.dns_rules.is_empty() {
+                None
+            } else {
+                Some(app.dns_index)
+            },
+        ),
+    );
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = match app.tab {
         Tab::Interfaces => vec![
@@ -386,6 +494,27 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             sep(),
             key_hint("q", "quit"),
         ],
+        Tab::Dns => match &app.dns_input {
+            DnsInput::Inactive => vec![
+                key_hint("a", "add rule"),
+                sep(),
+                key_hint("d", "delete rule"),
+                sep(),
+                key_hint("Tab", "next tab"),
+                sep(),
+                key_hint("q", "quit"),
+            ],
+            DnsInput::Domain(_) => vec![
+                key_hint("Enter", "confirm domain"),
+                sep(),
+                key_hint("Esc", "cancel"),
+            ],
+            DnsInput::Ip { .. } => vec![
+                key_hint("Enter", "confirm IP"),
+                sep(),
+                key_hint("Esc", "cancel"),
+            ],
+        },
         Tab::Spoofer => match app.spoofer_state {
             SpooferState::Idle => vec![
                 key_hint("Enter", "start"),

@@ -1,8 +1,22 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::app::{App, SpooferState, Tab};
+use super::app::{App, DnsInput, SpooferState, Tab};
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
+    // DNS text input gate — capture all keys except Ctrl+C when typing.
+    if app.dns_input != DnsInput::Inactive {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if app.spoofer_state == SpooferState::Running {
+                app.stop_spoofer();
+            } else {
+                app.running = false;
+            }
+            return;
+        }
+        handle_dns_input(app, key);
+        return;
+    }
+
     // Global keys
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -37,6 +51,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         Tab::Interfaces => handle_interfaces(app, key),
         Tab::Scanner => handle_scanner(app, key),
         Tab::Spoofer => handle_spoofer(app, key),
+        Tab::Dns => handle_dns(app, key),
     }
 }
 
@@ -103,6 +118,46 @@ fn handle_spoofer(app: &mut App, key: KeyEvent) {
             if app.spoofer_state == SpooferState::Idle {
                 app.clear_target();
             }
+        }
+        _ => {}
+    }
+}
+
+fn handle_dns(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('a') => {
+            app.start_dns_add();
+        }
+        KeyCode::Char('d') => {
+            app.remove_dns_rule();
+        }
+        KeyCode::Up => {
+            if app.dns_index > 0 {
+                app.dns_index -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.dns_index + 1 < app.dns_rules.len() {
+                app.dns_index += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_dns_input(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char(c) => {
+            app.dns_input_char(c);
+        }
+        KeyCode::Backspace => {
+            app.dns_input_backspace();
+        }
+        KeyCode::Enter => {
+            app.dns_input_confirm();
+        }
+        KeyCode::Esc => {
+            app.dns_input_cancel();
         }
         _ => {}
     }
